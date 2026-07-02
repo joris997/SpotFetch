@@ -197,19 +197,19 @@ def read_exportify_csv_file(file_path: str) -> list:
                 sanitize_string(artist) for artist in song["Artist Name(s)"].split(",")
             ]
             song["album_name"] = sanitize_string(song["Album Name"])
-            song["album_release_date"] = song["Release Date"]
+            song["album_release_date"] = song["Album Release Date"]
             song["track_duration_ms"] = (
-                int(song["Duration (ms)"]) if song["Duration (ms)"].isdigit() else 0
+                int(song["Track Duration (ms)"]) if song["Track Duration (ms)"].isdigit() else 0
             )
-            song["genres"] = sanitize_string(song["Genres"])
+            song["genres"] = sanitize_string(song["Artist Genres"])
             keys_to_remove = [
                 "Track Name",
                 "Album Name",
                 "Artist Name(s)",
-                "Release Date",
+                "Album Release Date",
                 "Explicit",
                 "Popularity",
-                "Genres",
+                "Artist Genres",
                 "Added By",
                 "Added At",
                 "Energy",
@@ -224,12 +224,13 @@ def read_exportify_csv_file(file_path: str) -> list:
                 "Acousticness",
                 "Tempo",
                 "Mode",
-                "Duration (ms)",
+                "Track Duration (ms)",
                 "Danceability",
             ]
 
+            # remove the unnecessary keys from the song dict, only if they exist
             for key in keys_to_remove:
-                del song[key]
+                song.pop(key, None)
         except Exception as e:
             raise Exception(
                 f"some error occured when handling metadata for song {song['track_name']}, error {e} skipping the song."

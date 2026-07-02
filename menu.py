@@ -3,6 +3,16 @@
 import functions
 import os
 import sys
+import glob
+import json
+
+try:
+    # Enables tab-completion in Prompt.ask (rich's console.input uses the
+    # builtin input(), which picks up readline automatically when imported).
+    import readline
+except ImportError:  # Windows without pyreadline3
+    readline = None
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -13,13 +23,119 @@ from rich import box
 
 console = Console()
 
-settings = {
+
+def _complete_path(text, state):
+    """Readline completer that suggests matching filesystem paths."""
+    expanded = os.path.expanduser(os.path.expandvars(text))
+    matches = []
+    for match in glob.glob(expanded + "*"):
+        # Append a separator so directories can be descended into on next Tab.
+        matches.append(match + os.sep if os.path.isdir(match) else match)
+    return matches[state] if state < len(matches) else None
+
+
+def ask_path(prompt, default=None):
+    """Like Prompt.ask, but with Tab-completion for filesystem paths."""
+    if readline is None:  # No readline (e.g. Windows) -> plain prompt.
+        return Prompt.ask(prompt, **({} if default is None else {"default": default}))
+
+    previous_completer = readline.get_completer()
+    previous_delims = readline.get_completer_delims()
+    readline.set_completer(_complete_path)
+    # Treat only whitespace as token boundaries so "/", "~", "." stay in the path.
+    readline.set_completer_delims(" \t\n")
+    # macOS ships libedit, which needs a different bind command than GNU readline.
+    if "libedit" in (readline.__doc__ or ""):
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+    try:
+        return Prompt.ask(prompt, **({} if default is None else {"default": default}))
+    finally:
+        readline.set_completer(previous_completer)
+        readline.set_completer_delims(previous_delims)
+
+
+# Default settings, used when no config file exists yet or a value is missing.
+DEFAULT_SETTINGS = {
     "format": "mp3",
     "output_path": ".",
     "cookie_file": None,
     "platform": "ytmusic",
-    "tolerance": 2
+    "tolerance": 2,
+    # Destination subfolder for the Spotify (Exportify) CSV load, relative to
+    # output_path. folder_mode is one of:
+    #   "main"   -> use output_path directly (".")
+    #   "custom" -> use output_path/<folder_name>
+    #   "csv"    -> use output_path/<csv file name without extension>
+    "folder_mode": "main",
+    "folder_name": "",
 }
+
+# Config file lives next to this script so settings persist regardless of the
+# directory the app is launched from.
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def load_settings():
+    """Load settings from the config file, falling back to defaults.
+
+    Any unknown keys in the file are ignored and any missing keys keep their
+    default value, so an old or partial config file won't break startup.
+    """
+    loaded = dict(DEFAULT_SETTINGS)
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return loaded
+
+    if isinstance(data, dict):
+        for key in DEFAULT_SETTINGS:
+            if key in data:
+                loaded[key] = data[key]
+    return loaded
+
+
+def save_settings():
+    """Persist the current settings to the config file."""
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except OSError as e:
+        console.print(f"Could not save settings: {e}", style="red")
+
+
+settings = load_settings()
+
+
+def folder_summary():
+    """Human-readable description of the current folder setting."""
+    mode = settings["folder_mode"]
+    if mode == "custom" and settings["folder_name"]:
+        return f"Subfolder: {settings['folder_name']}"
+    if mode == "csv":
+        return "Named after CSV file"
+    return "Output directory (.)"
+
+
+def resolve_output_folder(csv_path=None):
+    """Resolve the actual download directory from the folder setting.
+
+    Returns output_path itself for "main" mode, or a subfolder underneath it
+    for "custom"/"csv" modes. Falls back to output_path if a mode is missing
+    the information it needs (e.g. "csv" without a csv_path).
+    """
+    base = settings["output_path"]
+    mode = settings["folder_mode"]
+
+    if mode == "custom" and settings["folder_name"]:
+        return os.path.join(base, functions.sanitize_string(settings["folder_name"]))
+    if mode == "csv" and csv_path:
+        name = os.path.splitext(os.path.basename(csv_path))[0]
+        if name:
+            return os.path.join(base, functions.sanitize_string(name))
+    return base
 
 art = r"""
                         ____              _   _____    _       _     
@@ -55,6 +171,9 @@ def show_current_settings():
         ("\n"),
         ("Output Directory: ", "white"),
         (settings["output_path"], "cyan"),
+        ("\n"),
+        ("Download Folder: ", "white"),
+        (folder_summary(), "cyan"),
         ("\n"),
         ("Cookie File: ", "white"),
         (settings["cookie_file"] or "None", "cyan"),
@@ -96,8 +215,9 @@ def configure_settings():
             "Set duration tolerance",
             f"Currently tolerance={settings['tolerance']}min",
         ),
-        ("6", "Reset to Defaults", "Reset all settings"),
-        ("7", "Back to Main Menu", "Return to main menu"),
+        ("6", "Set Download Folder", f"Currently: {folder_summary()}"),
+        ("7", "Reset to Defaults", "Reset all settings"),
+        ("8", "Back to Main Menu", "Return to main menu"),
     ]
 
     table = Table(title="Settings Menu", box=box.ROUNDED, title_style="bold cyan")
@@ -113,8 +233,8 @@ def configure_settings():
 
     choice = Prompt.ask(
         "Select setting to configure",
-        choices=["1", "2", "3", "4", "5", "6", "7"],
-        default="7",
+        choices=["1", "2", "3", "4", "5", "6", "7", "8"],
+        default="8",
     )
 
     if choice == "1":
@@ -128,11 +248,16 @@ def configure_settings():
     elif choice == "5":
         set_duration_tolerance()
     elif choice == "6":
-        reset_settings()
+        set_download_folder()
     elif choice == "7":
+        reset_settings()
+    elif choice == "8":
         return
 
-    if choice != "7":
+    # A setting was changed above; persist it so it survives restarts.
+    save_settings()
+
+    if choice != "8":
         console.print()
         show_current_settings()
         if Confirm.ask("\nConfigure another setting?", default=False):
@@ -182,7 +307,7 @@ def set_output_directory():
     console.print(Panel("Set Output Directory", style="bold yellow"))
     console.print(f"Current directory: {settings['output_path']}")
 
-    path = Prompt.ask("Enter new output directory", default=settings["output_path"])
+    path = ask_path("Enter new output directory", default=settings["output_path"])
 
     if not os.path.exists(path):
         if Confirm.ask(f"Directory '{path}' doesn't exist. Create it?"):
@@ -209,7 +334,7 @@ def set_cookie_file():
     if Confirm.ask(
         "Do you want to use a cookie file?", default=settings["cookie_file"] is not None
     ):
-        cookie_path = Prompt.ask(
+        cookie_path = ask_path(
             "Enter cookie file path", default=settings["cookie_file"] or ""
         )
         if os.path.exists(cookie_path):
@@ -255,14 +380,55 @@ def set_download_platform():
     )
 
 
+def set_download_folder():
+    """Set the destination subfolder for the Spotify (Exportify) CSV load"""
+    console.print(Panel("Set Download Folder", style="bold yellow"))
+    console.print(
+        "Choose where songs from a Spotify CSV are placed, relative to the output directory."
+    )
+
+    table = Table(box=box.SIMPLE)
+    table.add_column("Option", style="cyan", justify="center")
+    table.add_column("Mode", style="green")
+    table.add_column("Description", style="white")
+
+    table.add_row(
+        "1", "Output directory", "Put files directly in the output directory (default)"
+    )
+    table.add_row("2", "Custom subfolder", "Put files in a subfolder name you choose")
+    table.add_row(
+        "3", "CSV file name", "Put files in a subfolder named after the CSV file"
+    )
+
+    console.print(table)
+
+    choice = Prompt.ask("Choose folder mode", choices=["1", "2", "3"], default="1")
+
+    if choice == "1":
+        settings["folder_mode"] = "main"
+        settings["folder_name"] = ""
+    elif choice == "2":
+        name = Prompt.ask(
+            "Enter subfolder name", default=settings["folder_name"] or ""
+        ).strip()
+        if name:
+            settings["folder_mode"] = "custom"
+            settings["folder_name"] = name
+        else:
+            console.print("No name given, keeping downloads in the output directory", style="yellow")
+            settings["folder_mode"] = "main"
+            settings["folder_name"] = ""
+    else:
+        settings["folder_mode"] = "csv"
+        settings["folder_name"] = ""
+
+    console.print(f"Download folder set to: {folder_summary()}", style="green")
+
+
 def reset_settings():
     """Reset all settings to defaults"""
     console.print(Panel("Reset Settings", style="bold yellow"))
-    settings["format"] = "mp3"
-    settings["output_path"] = "."
-    settings["cookie_file"] = None
-    settings["platform"] = "ytmusic"
-    settings["tolerance"] = 2
+    settings.update(dict(DEFAULT_SETTINGS))
     console.print("All settings reset to defaults", style="green")
 
 
@@ -296,7 +462,7 @@ def download_from_urls_file():
 
     console.print(Panel("Download from URLs File", style="bold blue"))
 
-    file_path = Prompt.ask("Enter path to text file with URLs")
+    file_path = ask_path("Enter path to text file with URLs")
 
     if not os.path.exists(file_path):
         console.print("File not found!", style="red")
@@ -327,7 +493,7 @@ def download_from_custom_csv():
     console.print(Panel("Download from Custom CSV", style="bold blue"))
     console.print("Expected CSV format: name,artist", style="italic")
 
-    file_path = Prompt.ask("Enter path to CSV file")
+    file_path = ask_path("Enter path to CSV file")
 
     if not os.path.exists(file_path):
         console.print("File not found!", style="red")
@@ -358,7 +524,7 @@ def process_tunemymusic_csv():
 
     console.print(Panel("Download using TuneMyMusic CSV", style="bold blue"))
 
-    file_path = Prompt.ask("Enter path to TuneMyMusic CSV file")
+    file_path = ask_path("Enter path to TuneMyMusic CSV file")
 
     if not os.path.exists(file_path):
         console.print("File not found!", style="red")
@@ -389,7 +555,7 @@ def process_exportify_csv():
 
     console.print(Panel("Download using Exportify CSV", style="bold blue"))
 
-    file_path = Prompt.ask("Enter path to Exportify CSV file")
+    file_path = ask_path("Enter path to Exportify CSV file")
 
     if not os.path.exists(file_path):
         console.print("File not found!", style="red")
@@ -402,7 +568,9 @@ def process_exportify_csv():
         console.print("Processing songs...", style="yellow")
 
         if songs:
-            download_spotify_songs_from_list(songs, settings["platform"])
+            target_dir = resolve_output_folder(file_path)
+            os.makedirs(target_dir, exist_ok=True)
+            download_spotify_songs_from_list(songs, settings["platform"], target_dir)
         else:
             console.print("No songs found in the CSV file", style="yellow")
 
@@ -449,8 +617,8 @@ def download_songs_from_list(songs, platform):
     )
 
 
-def download_spotify_songs_from_list(songs, platform):
-    """Download Spotify songs with full metadata"""
+def download_spotify_songs_from_list(songs, platform, output_path):
+    """Download Spotify songs with full metadata into output_path"""
 
 
     total_failed_songs = 0
@@ -472,7 +640,7 @@ def download_spotify_songs_from_list(songs, platform):
             functions.download_spotify_song(
                 settings["format"],
                 song,
-                settings["output_path"],
+                output_path,
                 settings["cookie_file"],
                 platform,
                 settings["tolerance"]
@@ -492,7 +660,7 @@ def download_spotify_songs_from_list(songs, platform):
         style="green bold",
     )
     console.print(
-        f"Find the failed songs at {settings['output_path']}/failed.txt and try to download them via url"
+        f"Find the failed songs at {output_path}/failed.txt and try to download them via url"
     )
 
 

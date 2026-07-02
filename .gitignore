@@ -4,3 +4,4 @@ __pycache__/
 .vscode/
 *.pyc
 cli_to_code.py
+config.json
